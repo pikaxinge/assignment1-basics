@@ -101,8 +101,14 @@ TOKEN_STR = "<|endoftext|>"
 def tokenize_text_chunk(
     text: str,
     special_tokens: list[str],
+    skip_special: bool = True,
 ) -> dict[tuple[bytes], int]:
-    """Pre-tokenize an entire text chunk in memory, processing only normal tokens."""
+    """Pre-tokenize an entire text chunk in memory.
+
+    When skip_special=True (default), special tokens are used only as split
+    boundaries and are not included in the counts. When skip_special=False,
+    special tokens themselves are also emitted as single tokens.
+    """
 
     text = text.replace("\r\n", "\n").replace("\r", "\n")
 
@@ -119,6 +125,12 @@ def tokenize_text_chunk(
         if not part:
             continue
         if special_tokens and part in special_tokens:
+            if skip_special:
+                continue
+            # Treat the whole special token as a single token
+            token_bytes = part.encode("utf-8")
+            token_tuple = (token_bytes,)
+            results[token_tuple] = results.get(token_tuple, 0) + 1
             continue
         for match in re.finditer(BASE_PATTERN_RE, part):
             token_bytes = match.group(0).encode("utf-8")
@@ -126,6 +138,39 @@ def tokenize_text_chunk(
             results[token_tuple] = results.get(token_tuple, 0) + 1
 
     return results
+
+
+def tokenize_text_chunk_seq(
+    text: str,
+    special_tokens: list[str],
+) -> list[tuple[bytes, ...]]:
+    """Return ordered token sequence for encode (keeps special tokens)."""
+
+    text = text.replace("\r\n", "\n").replace("\r", "\n")
+
+    tokens: list[tuple[bytes, ...]] = []
+
+    if special_tokens:
+        escaped = [re.escape(tok) for tok in special_tokens]
+        split_pattern = "(" + "|".join(escaped) + ")"
+        parts = re.split(split_pattern, text)
+    else:
+        parts = [text]
+
+    for part in parts:
+        if not part:
+            continue
+        if special_tokens and part in special_tokens:
+            # special token as a whole
+            token_bytes = part.encode("utf-8")
+            tokens.append((token_bytes,))
+            continue
+        for match in re.finditer(BASE_PATTERN_RE, part):
+            token_bytes = match.group(0).encode("utf-8")
+            print(f"[DEBUG] matched token bytes: {token_bytes}")
+            tokens.append(tuple(bytes([b]) for b in token_bytes))
+
+    return tokens
 
 def process_chunk(
     idx: int,
@@ -147,7 +192,7 @@ def process_chunk(
         chunk_file.seek(start)
         raw = chunk_file.read(end - start).decode("utf-8", errors="ignore")
 
-    results = tokenize_text_chunk(raw, special_tokens)
+    results = tokenize_text_chunk(raw, special_tokens, skip_special=True)
 
     # If called by parallel_pretokenize, put results in queue
     if result_queue is not None:
@@ -214,6 +259,7 @@ def parallel_pretokenize_text(
     text: str,
     special_tokens: list[str],
     num_processes: int,
+    skip_special: bool = True,
 ) -> dict[tuple[bytes], int]:
     """Perform parallel pretokenization on an entire in-memory text.
 
@@ -224,7 +270,7 @@ def parallel_pretokenize_text(
     """
 
     if num_processes <= 1:
-        return tokenize_text_chunk(text, special_tokens)
+        return tokenize_text_chunk(text, special_tokens, skip_special=skip_special)
 
     split_token = special_tokens[0] if special_tokens else ""
     boundaries = find_chunk_boundaries_text(text, num_processes, split_token)
@@ -236,7 +282,7 @@ def parallel_pretokenize_text(
         part = text[start:end]
 
         def _worker(idx: int, chunk_text: str, specials: list[str], queue: Queue) -> None:
-            res = tokenize_text_chunk(chunk_text, specials)
+            res = tokenize_text_chunk(chunk_text, specials, skip_special=skip_special)
             queue.put(res)
 
         p = Process(target=_worker, args=(i, part, special_tokens, q))
@@ -253,6 +299,48 @@ def parallel_pretokenize_text(
         p.join()
 
     return global_counts
+
+
+def parallel_pretokenize_text_seq(
+    text: str,
+    special_tokens: list[str],
+    num_processes: int,
+) -> list[tuple[bytes, ...]]:
+    """Parallel pretokenization that returns ordered token sequence for encode."""
+
+    if num_processes <= 1:
+        return tokenize_text_chunk_seq(text, special_tokens)
+
+    split_token = special_tokens[0] if special_tokens else ""
+    boundaries = find_chunk_boundaries_text(text, num_processes, split_token)
+
+    q: Queue = Queue()
+    processes: list[Process] = []
+
+    for i, (start, end) in enumerate(zip(boundaries[:-1], boundaries[1:]), 1):
+        part = text[start:end]
+
+        def _worker(idx: int, chunk_text: str, specials: list[str], queue: Queue) -> None:
+            seq = tokenize_text_chunk_seq(chunk_text, specials)
+            queue.put((idx, seq))
+
+        p = Process(target=_worker, args=(i, part, special_tokens, q))
+        p.start()
+        processes.append(p)
+
+    chunks: dict[int, list[tuple[bytes, ...]]] = {}
+    for _ in processes:
+        idx, seq = q.get()
+        chunks[idx] = seq
+
+    for p in processes:
+        p.join()
+
+    ordered: list[tuple[bytes, ...]] = []
+    for i in range(1, len(chunks) + 1):
+        ordered.extend(chunks.get(i, []))
+
+    return ordered
 
 
 def remove_special_tokens_from_counts(
